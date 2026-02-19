@@ -2,6 +2,23 @@
 
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
+## Branch Protection
+
+Direct pushes to `main` are blocked. Use a branch and open a Pull Request:
+
+```bash
+git checkout -b feature/your-feature-name
+# ... make changes ...
+git add . && git commit -m "Your message"
+git push -u origin feature/your-feature-name
+```
+
+Then open a PR on GitHub. To install the pre-push hook locally (after cloning):
+
+```bash
+cp scripts/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+```
+
 ## Getting Started
 
 First, run the development server:
