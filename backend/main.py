@@ -1,8 +1,12 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Dict
+from typing import List, Dict, Optional
 import json
+import os
+import re
+
+from anthropic import Anthropic
 
 app = FastAPI(title="Digital Cellar Grading API")
 
@@ -34,6 +38,7 @@ class Transcript(BaseModel):
 class GradeRequest(BaseModel):
     transcript: Transcript
     duration: int
+    style_influence: Optional[str] = None
 
 
 class JudgeFeedback(BaseModel):
@@ -46,13 +51,101 @@ class JudgeFeedback(BaseModel):
 
 class ConsensusFeedback(BaseModel):
     overall_score: float
+    letter_grade: str
+    headline: str
     consensus_summary: str
     judge_feedback: List[JudgeFeedback]
     next_steps: List[str]
 
 
 # ============================================
-# JUDGE: THE BUTCHER
+# AI JUDGES (Anthropic)
+# ============================================
+
+
+def _parse_judge_json(text: str, judge_name: str) -> Optional[JudgeFeedback]:
+    try:
+        json_match = re.search(r"\{[\s\S]*\}", text)
+        if not json_match:
+            return None
+        data = json.loads(json_match.group())
+        score = float(data.get("score", 5))
+        score = max(0, min(10, score))
+        return JudgeFeedback(
+            judge_name=judge_name,
+            score=round(score, 1),
+            critique=str(data.get("critique", ""))[:500],
+            strengths=[str(s) for s in data.get("strengths", [])][:5],
+            improvements=[str(i) for i in data.get("improvements", [])][:5],
+        )
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return None
+
+
+def run_butcher_ai(transcript: Transcript, style_influence: Optional[str]) -> Optional[JudgeFeedback]:
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None
+    client = Anthropic(api_key=api_key)
+    style_note = f" Consider style influence: {style_influence}." if style_influence else ""
+    user_content = f"""You are "The Butcher," a comedy judge focused on CONTENT and STRUCTURE: premise, setup-punchline, word economy, clarity, filler, callbacks.
+
+Analyze this comedy set transcript. Respond with ONLY a JSON object: {{"score": <0-10>, "critique": "<2-4 sentences>", "strengths": ["...", "..."], "improvements": ["...", "..."]}}
+
+Transcript:
+{transcript.text}
+{style_note}
+JSON only:"""
+
+    try:
+        response = client.messages.create(
+            model=os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514"),
+            max_tokens=1024,
+            messages=[{"role": "user", "content": user_content}],
+        )
+        text = response.content[0].text if response.content else ""
+        return _parse_judge_json(text, "The Butcher")
+    except Exception:
+        return None
+
+
+def run_metronome_ai(
+    transcript: Transcript, duration: int, style_influence: Optional[str]
+) -> Optional[JudgeFeedback]:
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None
+    client = Anthropic(api_key=api_key)
+    ts_summary = ""
+    if transcript.timestamps:
+        ts_summary = " Segment times: " + json.dumps(
+            [{"s": t.start, "e": t.end} for t in transcript.timestamps[:15]]
+        )
+    style_note = f" Style influence: {style_influence}." if style_influence else ""
+    user_content = f"""You are "The Metronome," a comedy judge focused on TIMING and RHYTHM: pacing, pauses, beats, delivery speed.
+
+Analyze this set. Respond with ONLY a JSON object: {{"score": <0-10>, "critique": "<2-4 sentences>", "strengths": ["...", "..."], "improvements": ["...", "..."]}}
+
+Transcript:
+{transcript.text}
+Duration: {duration} seconds.{ts_summary}
+{style_note}
+JSON only:"""
+
+    try:
+        response = client.messages.create(
+            model=os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514"),
+            max_tokens=1024,
+            messages=[{"role": "user", "content": user_content}],
+        )
+        text = response.content[0].text if response.content else ""
+        return _parse_judge_json(text, "The Metronome")
+    except Exception:
+        return None
+
+
+# ============================================
+# JUDGE: THE BUTCHER (rule-based fallback)
 # ============================================
 
 
@@ -234,6 +327,36 @@ class TheMetronome:
 # ============================================
 
 
+def score_to_letter(score: float) -> str:
+    if score >= 9:
+        return "A+"
+    if score >= 8.5:
+        return "A"
+    if score >= 8:
+        return "A-"
+    if score >= 7.5:
+        return "B+"
+    if score >= 7:
+        return "B"
+    if score >= 6.5:
+        return "B-"
+    if score >= 6:
+        return "C+"
+    if score >= 5:
+        return "C"
+    if score >= 4:
+        return "D"
+    return "F"
+
+
+def get_headline(score: float) -> str:
+    if score >= 8:
+        return "You killed it!"
+    if score >= 6:
+        return "Solid set. Room to tighten."
+    return "The material's there — trust the process."
+
+
 def generate_consensus(judge_feedbacks: List[JudgeFeedback]) -> ConsensusFeedback:
     """
     Synthesizes individual judge feedback into a unified report
@@ -283,8 +406,13 @@ def generate_consensus(judge_feedbacks: List[JudgeFeedback]) -> ConsensusFeedbac
 
     next_steps.append("🎯 Record another set and track your progress")
 
+    letter_grade = score_to_letter(weighted_score)
+    headline = get_headline(weighted_score)
+
     return ConsensusFeedback(
         overall_score=round(weighted_score, 1),
+        letter_grade=letter_grade,
+        headline=headline,
         consensus_summary=summary,
         judge_feedback=judge_feedbacks,
         next_steps=next_steps,
@@ -299,22 +427,32 @@ def generate_consensus(judge_feedbacks: List[JudgeFeedback]) -> ConsensusFeedbac
 @app.post("/grade", response_model=ConsensusFeedback)
 async def grade_set(request: GradeRequest):
     """
-    Grade a comedy set using the judge panel
+    Grade a comedy set using the judge panel. Uses AI (Anthropic) when
+    ANTHROPIC_API_KEY is set; otherwise falls back to rule-based judges.
     """
     try:
-        # Initialize judges
-        butcher = TheButcher()
-        metronome = TheMetronome()
+        use_ai = bool(os.environ.get("ANTHROPIC_API_KEY"))
+        judge_feedbacks: List[JudgeFeedback] = []
 
-        # Get individual feedback
-        butcher_feedback = butcher.analyze(request.transcript)
-        metronome_feedback = metronome.analyze(request.transcript, request.duration)
+        if use_ai:
+            butcher_fb = run_butcher_ai(request.transcript, request.style_influence)
+            metronome_fb = run_metronome_ai(
+                request.transcript, request.duration, request.style_influence
+            )
+            if butcher_fb and metronome_fb:
+                judge_feedbacks = [butcher_fb, metronome_fb]
+            else:
+                use_ai = False
 
-        judge_feedbacks = [butcher_feedback, metronome_feedback]
+        if not use_ai or not judge_feedbacks:
+            butcher = TheButcher()
+            metronome = TheMetronome()
+            judge_feedbacks = [
+                butcher.analyze(request.transcript),
+                metronome.analyze(request.transcript, request.duration),
+            ]
 
-        # Generate consensus
         consensus = generate_consensus(judge_feedbacks)
-
         return consensus
 
     except Exception as e:

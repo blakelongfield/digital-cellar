@@ -60,6 +60,24 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    const backendUrl = process.env.BACKEND_URL;
+    if (backendUrl) {
+      try {
+        const backendRes = await fetch(`${backendUrl.replace(/\/$/, '')}/grade`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (backendRes.ok) {
+          const feedback = await backendRes.json();
+          return NextResponse.json(feedback);
+        }
+      } catch (proxyErr) {
+        console.warn('Backend proxy failed, using rule-based grading:', proxyErr);
+      }
+    }
+
+    // Rule-based fallback (when BACKEND_URL unset or backend failed)
     const wordCount = transcript.text.split(/\s+/).length;
     const segmentCount = transcript.timestamps?.length ?? 1;
     const hasRuleOfThree = /pretending\.\s+Like.*\?.*\?.*\?/i.test(transcript.text) ||

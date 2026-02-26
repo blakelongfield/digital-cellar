@@ -17,6 +17,7 @@ export default function StageView() {
   const [isRecording, setIsRecording] = useState(false);
   const [recordingTime, setRecordingTime] = useState(0);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [processingPhase, setProcessingPhase] = useState<'transcribing' | 'grading' | null>(null);
   const [countdown, setCountdown] = useState<number | null>(null);
   const [styleInfluence, setStyleInfluence] = useState('');
   
@@ -119,41 +120,55 @@ export default function StageView() {
 
   const processRecording = async (videoBlob: Blob, duration: number) => {
     setIsProcessing(true);
+    setProcessingPhase('transcribing');
 
     try {
-      // Mock transcription for MVP
-      const mockTranscript = {
-        text: "So I went to the store yesterday... and I realized... nobody actually knows what they're doing. We're all just pretending. Like, the cashier? Pretending. The manager? Definitely pretending. Me? Oh, I'm the CEO of pretending.",
-        timestamps: [
-          { start: 0, end: 3.2, text: "So I went to the store yesterday..." },
-          { start: 3.5, end: 6.8, text: "and I realized..." },
-          { start: 7.0, end: 10.5, text: "nobody actually knows what they're doing." },
-          { start: 10.8, end: 13.2, text: "We're all just pretending." },
-          { start: 13.5, end: 16.8, text: "Like, the cashier? Pretending." },
-          { start: 17.0, end: 19.5, text: "The manager? Definitely pretending." },
-          { start: 19.8, end: 23.5, text: "Me? Oh, I'm the CEO of pretending." },
-        ],
-      };
+      // Transcribe recording with OpenAI Whisper
+      const formData = new FormData();
+      formData.append('file', videoBlob, 'recording.webm');
 
-      // Send to grading API
+      const transcribeRes = await fetch('/api/transcribe', {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!transcribeRes.ok) {
+        const errBody = await transcribeRes.json().catch(() => ({}));
+        throw new Error(errBody.error ?? `Transcription failed (${transcribeRes.status})`);
+      }
+
+      const transcript = await transcribeRes.json();
+      if (!transcript?.text) {
+        throw new Error('No speech detected in recording');
+      }
+
+      setProcessingPhase('grading');
+
+      // Send to grading API (proxies to backend when BACKEND_URL is set)
       const response = await fetch('/api/grade', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          transcript: mockTranscript,
+          transcript: { text: transcript.text, timestamps: transcript.timestamps ?? [] },
           duration,
           style_influence: styleInfluence || undefined,
         }),
       });
 
+      if (!response.ok) {
+        const errBody = await response.json().catch(() => ({}));
+        throw new Error(errBody.error ?? 'Grading failed');
+      }
+
       const feedback = await response.json();
-      
-      // Store in sessionStorage and navigate to review
+
       sessionStorage.setItem('latestFeedback', JSON.stringify(feedback));
       router.push('/review');
     } catch (err) {
       console.error('Processing error:', err);
       setIsProcessing(false);
+      setProcessingPhase(null);
+      alert(err instanceof Error ? err.message : 'Something went wrong. Try again.');
     }
   };
 
@@ -236,7 +251,9 @@ export default function StageView() {
                 <div className="text-center">
                   <div className="w-16 h-16 border-4 border-cyan-400 border-t-transparent rounded-full animate-spin mb-4 mx-auto" />
                   <p className="text-cyan-300 text-xl font-semibold">
-                    The Judges are deliberating...
+                    {processingPhase === 'transcribing'
+                      ? 'Transcribing your set...'
+                      : 'The Judges are deliberating...'}
                   </p>
                 </div>
               </div>
